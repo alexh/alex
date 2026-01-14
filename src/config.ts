@@ -40,8 +40,9 @@ export const AGENT_COMMANDS = {
 export const TABS = ['All', 'Running', 'Paused', 'Completed', 'Errors'] as const;
 
 // Loop settings
-export const MAX_ITERATIONS_DEFAULT = 100;
+export const MAX_ITERATIONS_DEFAULT = 20;
 export const STUCK_TIMEOUT_MINUTES = 5;
+export const AUTO_COMPLETE_ON_CRITERIA = true;
 
 // Circuit breaker thresholds
 export const CB_NO_PROGRESS_THRESHOLD = 3;        // Open after N loops with no file changes

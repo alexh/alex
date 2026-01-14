@@ -30,6 +30,7 @@ export async function fetchIssue(url: string): Promise<Issue> {
 
     const data = JSON.parse(result);
     const acceptanceCriteria = parseAcceptanceCriteria(data.body || '');
+    const originalAcceptanceCriteria = acceptanceCriteria.map(criterion => ({ ...criterion }));
 
     return {
       url: data.url || url,
@@ -38,6 +39,7 @@ export async function fetchIssue(url: string): Promise<Issue> {
       body: data.body || '',
       repo,
       acceptanceCriteria,
+      originalAcceptanceCriteria,
     };
   } catch (err: any) {
     if (err.message?.includes('gh: command not found')) {
@@ -86,6 +88,85 @@ export function closeIssue(url: string, comment?: string): CloseIssueResult {
   }
 }
 
+const criteriaSectionHeaders = [
+  /^#{1,3}\s*acceptance\s*criteria/i,
+  /^#{1,3}\s*done\s*when/i,
+  /^#{1,3}\s*stop\s*conditions/i,
+  /^#{1,3}\s*requirements/i,
+  /^\*\*acceptance\s*criteria\*\*/i,
+];
+
+function renderAcceptanceCriteriaSection(criteria: AcceptanceCriterion[]): string {
+  const lines = ['## Acceptance Criteria'];
+  if (criteria.length > 0) {
+    for (const ac of criteria) {
+      const checkbox = ac.completed ? '[x]' : '[ ]';
+      lines.push(`- ${checkbox} ${ac.text}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+export function applyAcceptanceCriteriaToIssueBody(body: string, criteria: AcceptanceCriterion[]): string {
+  const lines = body.split('\n');
+  let start = -1;
+  let end = lines.length;
+
+  for (let i = 0; i < lines.length; i++) {
+    if (criteriaSectionHeaders.some(header => header.test(lines[i].trim()))) {
+      start = i;
+      break;
+    }
+  }
+
+  if (start >= 0) {
+    for (let i = start + 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (/^#{1,3}\s+/.test(line) && !criteriaSectionHeaders.some(header => header.test(line.trim()))) {
+        end = i;
+        break;
+      }
+    }
+  }
+
+  const section = renderAcceptanceCriteriaSection(criteria).split('\n');
+
+  if (start >= 0) {
+    const before = lines.slice(0, start);
+    const after = lines.slice(end);
+    return [...before, ...section, ...after].join('\n').replace(/\n{3,}/g, '\n\n');
+  }
+
+  const trimmed = body.trimEnd();
+  const spacer = trimmed.length ? '\n\n' : '';
+  return `${trimmed}${spacer}${section.join('\n')}`;
+}
+
+export function updateIssueBody(url: string, body: string): void {
+  if (!url) {
+    throw new Error('Missing GitHub issue URL');
+  }
+
+  try {
+    execFileSync('gh', ['issue', 'edit', url, '--body', body], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 30000,
+    });
+  } catch (err: any) {
+    const stderr = err?.stderr?.toString?.() || '';
+    const stdout = err?.stdout?.toString?.() || '';
+    const message = (stderr || stdout || err?.message || '').trim();
+
+    if (err?.code === 'ENOENT' || message.includes('gh: command not found')) {
+      throw new Error('GitHub CLI (gh) not found. Install from https://cli.github.com');
+    }
+
+    const firstLine = message.split('\n')[0] || 'Unknown error';
+    throw new Error(`Failed to update issue: ${firstLine}`);
+  }
+}
+
 // Parse acceptance criteria from issue body
 // Looks for headings like "Acceptance Criteria", "Done When", "Stop Conditions"
 // Falls back to checkbox items
@@ -94,13 +175,7 @@ export function parseAcceptanceCriteria(body: string): AcceptanceCriterion[] {
   const lines = body.split('\n');
 
   // First, try to find a dedicated section
-  const sectionHeaders = [
-    /^#{1,3}\s*acceptance\s*criteria/i,
-    /^#{1,3}\s*done\s*when/i,
-    /^#{1,3}\s*stop\s*conditions/i,
-    /^#{1,3}\s*requirements/i,
-    /^\*\*acceptance\s*criteria\*\*/i,
-  ];
+  const sectionHeaders = criteriaSectionHeaders;
 
   let inSection = false;
   let sectionIndent = 0;

@@ -60,6 +60,22 @@ const claudeAdapter: AgentAdapter = {
     return altMatch ? altMatch[1] : null;
   },
 
+  buildResumePrompt(workSummary: string, remainingCriteria: string[]): string {
+    const criteriaList = remainingCriteria.length > 0
+      ? remainingCriteria.map((c, i) => `${i + 1}. ${c}`).join('\n')
+      : '(all criteria completed)';
+
+    return `RESUMING FROM PAUSE (previous session)
+
+## Summary of work done so far:
+${workSummary}
+
+## Remaining acceptance criteria:
+${criteriaList}
+
+Please continue working on this task. Review the summary above and pick up where you left off. When each criterion is complete, emit <criterion-complete>N</criterion-complete>. When all criteria are done, emit <promise>TASK COMPLETE</promise>.`;
+  },
+
   isAvailable(): boolean {
     try {
       execSync('which claude', { encoding: 'utf-8', stdio: 'pipe' });

@@ -15,13 +15,14 @@ import {
   AcceptanceCriterion,
 } from './types.js';
 import { getAdapter, SpawnArgs } from '../adapters/index.js';
-import { appendLog } from './logs.js';
+import { appendLog, generateResumeSummary } from './logs.js';
 import { buildPromptFromIssue } from './issues.js';
 import {
   COMPLETION_PROMISE,
   MAX_ITERATIONS_DEFAULT,
   CB_CONSECUTIVE_TEST_THRESHOLD,
   ITERATION_TIMEOUT_MS,
+  AUTO_COMPLETE_ON_CRITERIA,
 } from '../config.js';
 import {
   loadState,
@@ -53,6 +54,9 @@ const processes: Map<string, Subprocess> = new Map();
 // Iteration states per loop (in-memory during execution)
 const iterationStates: Map<string, LoopIterationState> = new Map();
 const criterionBuffers: Map<string, string> = new Map();
+
+// Pending interventions - will be injected into next iteration prompt
+const pendingInterventions: Map<string, string> = new Map();
 
 // Event emitter for loop events
 export const loopEvents = new EventEmitter();
@@ -392,8 +396,8 @@ async function runIterationLoop(
     iterState.circuitBreaker = recordIteration(iterState.circuitBreaker, analysis);
     appendLog(loopId, { type: 'system', content: `Circuit: ${getCbStatus(iterState.circuitBreaker)}` });
 
-    const allCriteriaComplete = loop.issue.acceptanceCriteria.length === 0 ||
-      loop.issue.acceptanceCriteria.every(criterion => criterion.completed);
+    const allCriteriaComplete = currentLoop.issue.acceptanceCriteria.length === 0 ||
+      currentLoop.issue.acceptanceCriteria.every(criterion => criterion.completed);
     const hasPromise = outputBuffer.includes(COMPLETION_PROMISE);
 
     // Check exit conditions
@@ -418,6 +422,12 @@ async function runIterationLoop(
       }
     }
 
+    if (AUTO_COMPLETE_ON_CRITERIA && allCriteriaComplete && !hasPromise) {
+      iterState.exitReason = 'completion_signal';
+      appendLog(loopId, { type: 'system', content: 'All criteria complete. Auto-completing loop.' });
+      break;
+    }
+
     // Check for explicit completion promise
     if (hasPromise) {
       if (allCriteriaComplete) {
@@ -433,7 +443,16 @@ async function runIterationLoop(
       continue;
     }
 
-    // Process exited with error (not timeout)
+    // Check for pending intervention (process was killed by operator)
+    const intervention = pendingInterventions.get(loopId);
+    if (intervention) {
+      pendingInterventions.delete(loopId);
+      appendLog(loopId, { type: 'system', content: 'Injecting operator intervention into next prompt' });
+      currentPrompt = `OPERATOR INTERVENTION:\n${intervention}\n\nPlease acknowledge this message and adjust your approach accordingly. Continue working on the task.`;
+      continue;
+    }
+
+    // Process exited with error (not timeout, not intervention)
     if (!result.timedOut && result.exitCode !== 0 && result.exitCode !== null) {
       appendLog(loopId, { type: 'error', content: `Iteration exited with code ${result.exitCode}` });
     }
@@ -606,6 +625,7 @@ function finalizeLoop(loopId: string, iterState: LoopIterationState): void {
 
   iterationStates.delete(loopId);
   criterionBuffers.delete(loopId);
+  pendingInterventions.delete(loopId);
 
   if (status === 'completed') {
     emit({ type: 'completed', loopId });
@@ -616,7 +636,7 @@ function finalizeLoop(loopId: string, iterState: LoopIterationState): void {
   }
 }
 
-// Pause a loop (SIGSTOP)
+// Pause a loop (SIGSTOP) - saves session ID for cross-session resume
 export function pauseLoop(loopId: string): void {
   const proc = processes.get(loopId);
   if (!proc || !proc.pid) {
@@ -625,15 +645,23 @@ export function pauseLoop(loopId: string): void {
 
   process.kill(proc.pid, 'SIGSTOP');
 
+  // Capture session ID for potential cross-session resume
+  const iterState = iterationStates.get(loopId);
+  const sessionId = iterState?.sessionId;
+
   let state = loadState();
-  state = updateLoop(state, loopId, { status: 'paused' });
+  state = updateLoop(state, loopId, {
+    status: 'paused',
+    pausedAt: new Date().toISOString(),
+    pausedSessionId: sessionId,
+  });
   saveState(state);
 
-  appendLog(loopId, { type: 'system', content: 'Loop paused' });
+  appendLog(loopId, { type: 'system', content: `Loop paused${sessionId ? ` (session: ${sessionId.substring(0, 8)}...)` : ''}` });
   emit({ type: 'paused', loopId });
 }
 
-// Resume a loop (SIGCONT)
+// Resume a loop (SIGCONT) - for same-session resume
 export function resumeLoop(loopId: string): void {
   const proc = processes.get(loopId);
   if (!proc || !proc.pid) {
@@ -648,6 +676,100 @@ export function resumeLoop(loopId: string): void {
 
   appendLog(loopId, { type: 'system', content: 'Loop resumed' });
   emit({ type: 'resumed', loopId });
+}
+
+/**
+ * Resume a paused loop from a previous session.
+ * Spawns a new agent process with context from logs.
+ * Attempts to use stored sessionId with --continue, falls back to fresh start with summary.
+ */
+export async function resumePausedLoop(loopId: string): Promise<void> {
+  let state = loadState();
+  const loop = state.loops.find(l => l.id === loopId);
+
+  if (!loop) {
+    throw new Error(`Loop not found: ${loopId}`);
+  }
+
+  if (loop.status !== 'paused') {
+    throw new Error(`Loop is not paused: ${loopId} (status: ${loop.status})`);
+  }
+
+  // Check if there's still an active process (shouldn't happen for cross-session)
+  if (processes.has(loopId)) {
+    // Same-session resume - use SIGCONT instead
+    resumeLoop(loopId);
+    return;
+  }
+
+  const adapter = getAdapter(loop.agent);
+  if (!adapter) {
+    throw new Error(`Adapter not found for agent: ${loop.agent}`);
+  }
+
+  if (!adapter.isAvailable()) {
+    throw new Error(`Agent CLI not available: ${loop.agent}`);
+  }
+
+  // Generate work summary from logs
+  const workSummary = generateResumeSummary(loopId);
+
+  // Get remaining criteria
+  const remainingCriteria = loop.issue.acceptanceCriteria
+    .filter(c => !c.completed)
+    .map(c => c.text);
+
+  // Build resume prompt
+  const resumePrompt = adapter.buildResumePrompt
+    ? adapter.buildResumePrompt(workSummary, remainingCriteria)
+    : `Resuming from pause. Previous work summary:\n${workSummary}\n\nRemaining criteria: ${remainingCriteria.join(', ') || 'none'}`;
+
+  appendLog(loopId, { type: 'system', content: '--- CROSS-SESSION RESUME ---' });
+  appendLog(loopId, { type: 'system', content: `Resuming paused loop from previous session` });
+
+  // Capture git baseline for progress detection
+  const gitBaseline = captureGitBaseline(loop.workingDir);
+
+  // Initialize iteration state, preserving iteration count
+  const previousIteration = loop.iteration || 0;
+  const iterState: LoopIterationState = {
+    iteration: previousIteration,
+    maxIterations: MAX_ITERATIONS_DEFAULT,
+    circuitBreaker: createCircuitBreaker(),
+    analysisHistory: [],
+    sessionId: loop.pausedSessionId,  // Try to resume the session
+  };
+  iterationStates.set(loopId, iterState);
+
+  // Initialize rate limiter
+  let rateLimiter = createRateLimiter();
+
+  // Update state - clear pause fields and set to running
+  state = updateLoop(state, loopId, {
+    status: 'running',
+    pausedAt: undefined,
+    pausedSessionId: undefined,
+    pausedFromPreviousSession: undefined,
+  });
+  saveState(state);
+  emit({ type: 'resumed', loopId });
+
+  // Run iteration loop with resume prompt
+  try {
+    await runIterationLoop(loopId, loop, adapter, resumePrompt, iterState, rateLimiter, gitBaseline);
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    appendLog(loopId, { type: 'error', content: `Resume error: ${errorMsg}` });
+
+    let state = loadState();
+    state = updateLoop(state, loopId, {
+      status: 'error',
+      error: errorMsg,
+      endedAt: new Date().toISOString(),
+    });
+    saveState(state);
+    emit({ type: 'error', loopId, error: errorMsg });
+  }
 }
 
 // Stop a loop (SIGTERM)
@@ -711,17 +833,36 @@ export async function retryLoop(loopId: string): Promise<void> {
   await startLoop(loopId);
 }
 
-// Send intervention (write to stdin)
+// Send intervention - interrupts current process and resumes with message
 export function sendIntervention(loopId: string, message: string): void {
   const proc = processes.get(loopId);
-  if (!proc || !proc.stdin || typeof proc.stdin === 'number') {
+  if (!proc) {
     throw new Error(`No running process for loop: ${loopId}`);
   }
 
-  // proc.stdin is FileSink when stdin: 'pipe' was used
-  const encoder = new TextEncoder();
-  proc.stdin.write(encoder.encode(message + '\n'));
-  appendLog(loopId, { type: 'operator', content: message });
+  const iterState = iterationStates.get(loopId);
+  if (!iterState) {
+    throw new Error(`No iteration state for loop: ${loopId}`);
+  }
+
+  // Store the intervention message - will be picked up by the iteration loop
+  pendingInterventions.set(loopId, message);
+  appendLog(loopId, { type: 'operator', content: `[INTERVENTION] ${message}` });
+  appendLog(loopId, { type: 'system', content: 'Interrupting current process to inject intervention...' });
+
+  // Kill the current process - the iteration loop will detect this and continue
+  // with the intervention message in the next prompt
+  proc.kill('SIGTERM');
+}
+
+// Check if there's a pending intervention for a loop
+export function getPendingIntervention(loopId: string): string | undefined {
+  return pendingInterventions.get(loopId);
+}
+
+// Clear a pending intervention after it's been used
+export function clearPendingIntervention(loopId: string): void {
+  pendingInterventions.delete(loopId);
 }
 
 // Get running process for a loop
@@ -767,4 +908,62 @@ export function killAll(): void {
   }
   iterationStates.clear();
   criterionBuffers.clear();
+  pendingInterventions.clear();
+}
+
+/**
+ * Mark orphaned paused loops as from a previous session.
+ * Call this on TUI startup to detect paused loops that lost their process.
+ */
+export function markOrphanedPausedLoops(): number {
+  let state = loadState();
+  let orphanCount = 0;
+
+  for (const loop of state.loops) {
+    if (loop.status === 'paused' && !processes.has(loop.id)) {
+      // This loop was paused but has no active process - it's from a previous session
+      if (!loop.pausedFromPreviousSession) {
+        state = updateLoop(state, loop.id, { pausedFromPreviousSession: true });
+        orphanCount++;
+      }
+    }
+  }
+
+  if (orphanCount > 0) {
+    saveState(state);
+  }
+
+  return orphanCount;
+}
+
+/**
+ * Discard a paused loop (remove it from state).
+ */
+export function discardPausedLoop(loopId: string): void {
+  let state = loadState();
+  const loop = state.loops.find(l => l.id === loopId);
+
+  if (!loop) {
+    throw new Error(`Loop not found: ${loopId}`);
+  }
+
+  if (loop.status !== 'paused') {
+    throw new Error(`Can only discard paused loops (status: ${loop.status})`);
+  }
+
+  // Remove from state
+  state = {
+    ...state,
+    loops: state.loops.filter(l => l.id !== loopId),
+  };
+  saveState(state);
+
+  appendLog(loopId, { type: 'system', content: 'Loop discarded by user' });
+}
+
+/**
+ * Check if a paused loop can be resumed in the current session (has active process).
+ */
+export function canResumeInSession(loopId: string): boolean {
+  return processes.has(loopId);
 }

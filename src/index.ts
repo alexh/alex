@@ -6,6 +6,7 @@ import { createScreen } from './ui/screen.js';
 import { colors } from './config.js';
 import { statusColors, statusIcons } from './ui/theme.js';
 import {
+  Issue,
   Loop,
   LoopStatus,
   loadState,
@@ -13,19 +14,27 @@ import {
   updateLoop,
   fetchIssue,
   closeIssue,
+  updateIssueBody,
+  applyAcceptanceCriteriaToIssueBody,
   createLoop,
   startLoop,
   pauseLoop,
   resumeLoop,
+  resumePausedLoop,
   stopLoop,
   retryLoop,
   sendIntervention,
   loopEvents,
   appendLog,
   readRecentLogs,
+  readLogs,
   tailLog,
   formatLogEntry,
+  getLogPath,
   killAll,
+  markOrphanedPausedLoops,
+  discardPausedLoop,
+  canResumeInSession,
 } from './core/index.js';
 import './adapters/index.js';  // Register adapters
 import { createInputManager, ManagedInput } from './ui/input-manager.js';
@@ -36,6 +45,13 @@ function main(): void {
 
   // App state
   let state = loadState();
+
+  // Mark any paused loops without active processes as from previous session
+  const orphanedCount = markOrphanedPausedLoops();
+  if (orphanedCount > 0) {
+    state = loadState(); // Reload after marking
+  }
+
   let selectedLoopId: string | null = state.loops[0]?.id || null;
   let logTailCleanup: (() => void) | null = null;
 
@@ -158,7 +174,7 @@ function main(): void {
     top: 0,
     left: 0,
     width: '100%',
-    height: 3,
+    height: 1,
     tags: true,
     style: { fg: 'white', bg: 'black', transparent: true },
   } as any);
@@ -171,7 +187,7 @@ function main(): void {
       error: state.loops.filter(l => l.status === 'error').length,
     };
     headerBox.setContent(
-      `\n {bold}{#ff4fd8-fg}◆ ALEX{/}{/bold} {#666-fg}│{/} ` +
+      ` {bold}{#ff4fd8-fg}◆ ALEX{/}{/bold} {#666-fg}│{/} ` +
       `{#2de2e6-fg}${counts.running}{/} running {#666-fg}│{/} ` +
       `{#ffbe0b-fg}${counts.paused}{/} paused {#666-fg}│{/} ` +
       `{#00f5d4-fg}${counts.completed}{/} done {#666-fg}│{/} ` +
@@ -185,10 +201,10 @@ function main(): void {
   // ═══════════════════════════════════════════════════════════════════════════
   const tabBar = blessed.box({
     parent: screen,
-    top: 3,
+    top: 1,
     left: 0,
     width: '100%',
-    height: 3,
+    height: 1,
     tags: true,
     style: { fg: 'white', bg: 'black', transparent: true },
   } as any);
@@ -205,7 +221,7 @@ function main(): void {
 
   const tabButtons = tabDefs.map((tab, index) => blessed.button({
     parent: tabBar,
-    top: 1,
+    top: 0,
     left: 1,
     width: 10,
     height: 1,
@@ -279,10 +295,10 @@ function main(): void {
     parent: screen,
     label: ' {bold}{#ff4fd8-fg}◆ LOOPS{/} ',
     tags: true,
-    top: 6,
+    top: 2,
     left: 1,
     width: '30%-2',
-    height: '100%-10',
+    height: '100%-4',
     keys: true,
     mouse: true,
     vi: true,
@@ -302,35 +318,46 @@ function main(): void {
   let loopListData: Loop[] = [];
 
 
-  function formatDuration(startedAt?: string): string {
+  function formatDuration(startedAt?: string, endedAt?: string): string {
     if (!startedAt) return '--';
-    const ms = Date.now() - new Date(startedAt).getTime();
+    const endTime = endedAt ? new Date(endedAt).getTime() : Date.now();
+    const ms = endTime - new Date(startedAt).getTime();
     const mins = Math.floor(ms / 60000);
     if (mins < 60) return `${mins}m`;
     const hours = Math.floor(mins / 60);
     return `${hours}h${mins % 60}m`;
   }
 
+  function getLoopTimestamp(loop: Loop): number {
+    // Use most recent action: endedAt if finished, otherwise startedAt, otherwise 0
+    const ts = loop.endedAt || loop.startedAt;
+    return ts ? new Date(ts).getTime() : 0;
+  }
+
   function updateLoopList(): void {
     const filteredLoops = getFilteredLoops();
-    loopListData = filteredLoops;
+    // Sort by most recent action (newest first)
+    const sortedLoops = [...filteredLoops].sort((a, b) => getLoopTimestamp(b) - getLoopTimestamp(a));
+    loopListData = sortedLoops;
     if (state.loops.length === 0) {
       loopListWindow.setItems(['{#666-fg}No loops yet. Press [N] to create one.{/}']);
       return;
     }
-    if (filteredLoops.length === 0) {
+    if (sortedLoops.length === 0) {
       const emptyLabel = tabDefs[activeTabIndex].label.toLowerCase();
       const message = emptyLabel === 'all' ? 'No loops yet.' : `No ${emptyLabel} loops.`;
       loopListWindow.setItems([`{#666-fg}${message}{/}`]);
       return;
     }
-    const items = filteredLoops.map((loop) => {
+    const items = sortedLoops.map((loop) => {
       const icon = statusIcons[loop.status] || '?';
       const color = statusColors[loop.status] || colors.text;
-      const time = formatDuration(loop.startedAt);
+      const time = formatDuration(loop.startedAt, loop.endedAt);
       const prefix = loop.agent === 'claude' ? 'CLA' : 'CDX';
       const title = loop.issue.title.substring(0, 22);
-      return ` {${color}-fg}${icon}{/} {bold}${prefix} #${loop.issue.number}{/} ${title}... {#666-fg}${time}{/}`;
+      // Show indicator for paused loops from previous session
+      const prevSess = loop.pausedFromPreviousSession ? ' {#ffbe0b-fg}◀prev{/}' : '';
+      return ` {${color}-fg}${icon}{/} {bold}${prefix} #${loop.issue.number}{/} ${title}...${prevSess} {#666-fg}${time}{/}`;
     });
     loopListWindow.setItems(items);
   }
@@ -373,10 +400,10 @@ function main(): void {
     parent: screen,
     label: ' {bold}{#2de2e6-fg}◆ LOOP DETAIL{/} ',
     tags: true,
-    top: 6,
+    top: 2,
     left: '30%',
     width: '70%-1',
-    height: '50%-5',
+    height: '50%-2',
     border: 'line',
     style: {
       fg: 'white',
@@ -393,14 +420,15 @@ function main(): void {
 
   const criteriaList = blessed.list({
     parent: detailWindow,
-    top: 6,
+    top: 5,
     left: 1,
-    width: '100%-3',
+    width: '100%-4',
     height: 8,
     tags: true,
     keys: true,
     vi: true,
     mouse: true,
+    scrollable: true,
     style: {
       fg: 'white',
       bg: 'black',
@@ -409,14 +437,6 @@ function main(): void {
     scrollbar: { ch: '█', style: { bg: 'magenta' } },
   } as any);
 
-  const actionsBox = blessed.box({
-    parent: detailWindow,
-    left: 1,
-    height: 3,
-    width: '100%-3',
-    tags: true,
-    style: { fg: 'white', bg: 'black', transparent: true },
-  } as any);
 
   const runningSymbols = ['·', '✻', '✽', '✶', '✳', '✢', '✦', '✧', '✵', '✸', '✹', '✺'];
   let runningSymbolIndex = 0;
@@ -427,16 +447,26 @@ function main(): void {
     const statusIcon = loop.status === 'running'
       ? runningSymbol
       : (statusIcons[loop.status] || '?');
-    const time = formatDuration(loop.startedAt);
+    const time = formatDuration(loop.startedAt, loop.endedAt);
     const issueStatus = loop.issueClosed ? ' {#00f5d4-fg}✓ closed{/}' : '';
 
+    // Show indicator for paused loops from previous session
+    const prevSessionIndicator = loop.pausedFromPreviousSession
+      ? ' {#ffbe0b-fg}◀ PREVIOUS SESSION{/}'
+      : '';
+    const pausedAtInfo = loop.pausedAt && loop.status === 'paused'
+      ? `  {#666-fg}│{/}  {#9b5de5-fg}Paused:{/} ${new Date(loop.pausedAt).toLocaleString()}`
+      : '';
+
+    const logPath = getLogPath(loop.id);
     let content =
       `{bold}{#fff-fg}${loop.issue.title}{/}{/bold}\n` +
       `{#666-fg}─────────────────────────────────────────────────────{/}\n` +
-      `{${statusColor}-fg}${statusIcon} ${loop.status.toUpperCase()}{/}  {#666-fg}│{/}  ` +
+      `{${statusColor}-fg}${statusIcon} ${loop.status.toUpperCase()}{/}${prevSessionIndicator}  {#666-fg}│{/}  ` +
       `{#9b5de5-fg}Agent:{/} ${loop.agent}  {#666-fg}│{/}  ` +
       `{#9b5de5-fg}Time:{/} ${time}  {#666-fg}│{/}  ` +
-      `{#9b5de5-fg}Issue:{/} #${loop.issue.number}${issueStatus}\n\n`;
+      `{#9b5de5-fg}Issue:{/} #${loop.issue.number}${issueStatus}${pausedAtInfo}\n` +
+      `{#9b5de5-fg}Log:{/} ${logPath}\n\n`;
 
     content += `{#ffbe0b-fg}━━━ Acceptance Criteria ━━━{/}\n`;
 
@@ -452,36 +482,14 @@ function main(): void {
       })
       : ['{#666-fg}No acceptance criteria{/}'];
     criteriaList.setItems(items);
-    criteriaList.height = Math.min(10, Math.max(3, items.length));
-
-    const actionsTop = 6 + (criteriaList.height as number) + 2;
-    actionsBox.top = actionsTop;
-
-    let actions = `{#2de2e6-fg}━━━ Actions ━━━{/}\n`;
-    if (loop.status === 'running') {
-      actions += `  {#ff4fd8-fg}[P]{/} Pause  {#ff4fd8-fg}[S]{/} Stop  {#ff4fd8-fg}[I]{/} Intervene`;
-    } else if (loop.status === 'paused') {
-      actions += `  {#ff4fd8-fg}[P]{/} Resume  {#ff4fd8-fg}[S]{/} Stop`;
-    } else if (loop.status === 'queued') {
-      actions += `  {#ff4fd8-fg}[Enter]{/} Start  {#ff4fd8-fg}[S]{/} Delete`;
-    } else if (loop.status === 'error' || loop.status === 'stopped') {
-      actions += `  {#ff4fd8-fg}[R]{/} Retry`;
-    } else if (loop.status === 'completed') {
-      if (loop.issueClosed) {
-        actions += `  {#00f5d4-fg}Loop completed{/}  {#666-fg}│{/}  {#666-fg}Issue already closed{/}`;
-      } else {
-        actions += `  {#00f5d4-fg}Loop completed{/}  {#666-fg}│{/}  {#ff4fd8-fg}[C]{/} Close Issue`;
-      }
-    } else {
-      actions += `  {#666-fg}Loop is ${loop.status}{/}`;
-    }
+    // Keep criteria list height constrained to fit within detail pane
+    criteriaList.height = Math.min(8, Math.max(2, items.length));
 
     if (loop.error) {
-      actions += `\n\n{#ff006e-fg}Error: ${loop.error}{/}`;
+      content += `\n{#ff006e-fg}Error: ${loop.error}{/}`;
     }
 
     detailWindow.setContent(content);
-    actionsBox.setContent(actions);
   }
 
   function toggleCriterion(loopId: string, index: number): void {
@@ -541,10 +549,10 @@ function main(): void {
     parent: screen,
     label: ' {bold}{#9b5de5-fg}◆ LIVE TRANSCRIPT{/} ',
     tags: true,
-    top: '50%+1',
+    top: '50%',
     left: '30%',
     width: '70%-1',
-    height: '50%-5',
+    height: '50%-2',
     keys: true,
     vi: true,
     border: 'line',
@@ -562,6 +570,92 @@ function main(): void {
     mouse: true,
     padding: { left: 1 },
   } as any);
+
+  let logViewer: blessed.Widgets.BoxElement | null = null;
+  let logViewerLog: blessed.Widgets.Log | null = null;
+  let logViewerCleanup: (() => void) | null = null;
+
+  function buildFullLogContent(loopId: string): string {
+    const entries = readLogs(loopId);
+    if (entries.length === 0) {
+      return '{#666-fg}No log entries yet.{/}';
+    }
+    return entries.map(entry => formatLogEntry(entry)).join('\n');
+  }
+
+  function closeLogViewer(): void {
+    if (!logViewer) return;
+    if (logViewerCleanup) {
+      logViewerCleanup();
+      logViewerCleanup = null;
+    }
+    logViewer.destroy();
+    logViewerLog = null;
+    logViewer = null;
+    loopListWindow.focus();
+    screen.render();
+  }
+
+  function openLogViewer(loop: Loop): void {
+    if (logViewer) return;
+    logViewer = blessed.box({
+      parent: screen,
+      label: ' {bold}{#ff4fd8-fg}◆ FULL LOG{/} ',
+      tags: true,
+      top: 1,
+      left: 2,
+      width: '100%-4',
+      height: '100%-4',
+      border: 'line',
+      keys: true,
+      vi: true,
+      mouse: true,
+      style: {
+        fg: 'white',
+        bg: 'black',
+        transparent: true,
+        border: { fg: '#ff4fd8' },
+        label: { fg: '#ff4fd8' },
+      },
+      padding: { left: 0, right: 0, top: 0, bottom: 0 },
+    } as any);
+
+    logViewerLog = blessed.log({
+      parent: logViewer,
+      top: 1,
+      left: 1,
+      width: '100%-2',
+      height: '100%-2',
+      tags: true,
+      keys: true,
+      vi: true,
+      mouse: true,
+      scrollable: true,
+      alwaysScroll: true,
+      scrollbar: { ch: '█', style: { bg: 'magenta' } },
+      style: {
+        fg: 'white',
+        bg: 'black',
+        transparent: true,
+      },
+      padding: { left: 1, right: 1 },
+      content: buildFullLogContent(loop.id),
+    } as any);
+
+    (logViewerLog as any)._clines = null;
+    logViewerLog.setScroll(0);
+
+    logViewerCleanup = tailLog(loop.id, (entry) => {
+      if (!logViewerLog || !entry.content.trim()) return;
+      logViewerLog.log(formatLogEntry(entry));
+      screen.render();
+    });
+
+    logViewer.key(['escape', 'l', 'L'], closeLogViewer);
+    logViewerLog.key(['escape', 'l', 'L'], closeLogViewer);
+    logViewerLog.focus();
+    screen.render();
+  }
 
   function setActivePane(pane: blessed.Widgets.BoxElement | blessed.Widgets.ListElement | blessed.Widgets.Log): void {
     const activeBorder = { fg: '#00f5d4' };
@@ -615,15 +709,21 @@ function main(): void {
       logTailCleanup = null;
     }
 
+    // Clear log widget properly (blessed.log quirk)
     logWindow.setContent('');
-    logWindow.log('{#444-fg}════════════════════════════════════════════════════════════{/}');
+    (logWindow as any)._clines = null;
+    logWindow.setScroll(0);
 
     // Load recent logs
-    const recentLogs = readRecentLogs(loopId, 200);
+    const recentLogs = readRecentLogs(loopId, 50);
     for (const entry of recentLogs) {
       if (!entry.content.trim()) continue;
       logWindow.log(formatLogEntry(entry));
     }
+
+    // Scroll to bottom and render
+    logWindow.setScrollPerc(100);
+    screen.render();
 
     // Start tailing
     logTailCleanup = tailLog(loopId, (entry) => {
@@ -644,7 +744,7 @@ function main(): void {
     bottom: 0,
     left: 0,
     right: 0,
-    height: 3,
+    height: 1,
     tags: true,
     style: { fg: 'white', bg: 'black', transparent: true },
     content: '',
@@ -655,26 +755,30 @@ function main(): void {
     const quit = '{#ff4fd8-fg}[Q]{/}uit';
     const newLoop = '{#ff4fd8-fg}[N]{/}ew';
     const refresh = '{#ff4fd8-fg}[T]{/} Refresh';
+    const viewLogs = '{#ff4fd8-fg}[L]{/} Logs';
 
     let actions = '';
     if (!loop) {
       actions = `${newLoop} ${nav} {#666-fg}│{/} ${quit}`;
     } else if (loop.status === 'running') {
-      actions = `${newLoop} ${refresh} {#ff4fd8-fg}[P]{/}ause {#ff4fd8-fg}[S]{/}top {#ff4fd8-fg}[I]{/}ntervene {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
+      actions = `${newLoop} ${refresh} ${viewLogs} {#ff4fd8-fg}[P]{/}ause {#ff4fd8-fg}[S]{/}top {#ff4fd8-fg}[I]{/}ntervene {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
     } else if (loop.status === 'paused') {
-      actions = `${newLoop} ${refresh} {#ff4fd8-fg}[P]{/} Resume {#ff4fd8-fg}[S]{/}top {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
+      const isPrevSession = loop.pausedFromPreviousSession;
+      const discardAction = isPrevSession ? ' {#ff4fd8-fg}[D]{/}iscard' : '';
+      const resumeLabel = isPrevSession ? ' Resume(rebuild)' : ' Resume';
+      actions = `${newLoop} ${refresh} ${viewLogs} {#ff4fd8-fg}[P]{/}${resumeLabel} {#ff4fd8-fg}[S]{/}top${discardAction} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
     } else if (loop.status === 'queued') {
-      actions = `${newLoop} ${refresh} {#2de2e6-fg}Enter{/} Start {#ff4fd8-fg}[S]{/} Delete {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
+      actions = `${newLoop} ${refresh} ${viewLogs} {#2de2e6-fg}Enter{/} Start {#ff4fd8-fg}[S]{/} Delete {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
     } else if (loop.status === 'error' || loop.status === 'stopped') {
-      actions = `${newLoop} ${refresh} {#ffbe0b-fg}[R] RETRY{/} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
+      actions = `${newLoop} ${refresh} ${viewLogs} {#ffbe0b-fg}[R] RETRY{/} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
     } else if (loop.status === 'completed') {
       const closeIssueAction = loop.issueClosed ? '' : ` {#ff4fd8-fg}[C]{/}lose Issue`;
-      actions = `${newLoop} ${refresh}${closeIssueAction} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
+      actions = `${newLoop} ${refresh} ${viewLogs}${closeIssueAction} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
     } else {
-      actions = `${newLoop} ${refresh} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
+      actions = `${newLoop} ${refresh} ${viewLogs} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
     }
 
-    statusBar.setContent(`\n ${actions}`);
+    statusBar.setContent(` ${actions}`);
   }
 
   // Initialize status bar
@@ -903,29 +1007,252 @@ function main(): void {
       logWithGlow(`{#666-fg}[system]{/} Fetching issue from ${url}...`, 'system');
       screen.render();
 
+      const openCriteriaModal = (issue: Issue): void => {
+        const originalCriteria = issue.originalAcceptanceCriteria?.map(criterion => ({ ...criterion }))
+          ?? issue.acceptanceCriteria.map(criterion => ({ ...criterion }));
+        const criteriaDraft = issue.acceptanceCriteria.length > 0
+          ? issue.acceptanceCriteria.map(criterion => ({ ...criterion }))
+          : [{ text: '', completed: false }];
+
+        const modal = blessed.box({
+          parent: screen,
+          label: ' {bold}{#ff4fd8-fg}◆ ACCEPTANCE CRITERIA{/} ',
+          tags: true,
+          top: 'center',
+          left: 'center',
+          width: 80,
+          height: 20,
+          border: 'line',
+          style: { fg: 'white', bg: 'blue', transparent: true, border: { fg: 'magenta' } },
+          shadow: true,
+          keys: true,
+        } as any);
+
+        blessed.text({
+          parent: modal,
+          top: 1,
+          left: 2,
+          tags: true,
+          content: '{#eaeaea-fg}↑↓ navigate  Tab = edit  Enter = accept  [+] add  [-] remove{/}',
+        });
+
+        // Scrollable list container
+        const listBox = blessed.list({
+          parent: modal,
+          top: 3,
+          left: 2,
+          width: 74,
+          height: 12,
+          border: 'line',
+          scrollable: true,
+          alwaysScroll: true,
+          scrollbar: { ch: '│', track: { bg: 'black' }, style: { bg: 'cyan' } },
+          keys: true,
+          vi: true,
+          mouse: true,
+          tags: true,
+          style: {
+            border: { fg: 'cyan' },
+            selected: { fg: 'black', bg: 'cyan' },
+            item: { fg: 'white' },
+          },
+        } as any);
+
+        let selectedIndex = 0;
+        let editingIndex: number | null = null;
+        let editInput: ReturnType<typeof createCursorInput> | null = null;
+
+        const renderList = (): void => {
+          const items = criteriaDraft.map((c, i) => {
+            const num = `{#666-fg}${String(i + 1).padStart(2)}.{/}`;
+            const text = c.text || '{#666-fg}(empty){/}';
+            return ` ${num} ${text}`;
+          });
+          listBox.setItems(items);
+          listBox.select(selectedIndex);
+          screen.render();
+        };
+
+        const startEditing = (index: number): void => {
+          if (editInput) {
+            // Save current edit first
+            criteriaDraft[editingIndex!].text = editInput.getValue().trim();
+            editInput.box.destroy();
+            editInput = null;
+          }
+
+          editingIndex = index;
+          selectedIndex = index;
+
+          // Create inline text input overlay
+          editInput = createCursorInput({
+            parent: modal,
+            top: 4 + index - (listBox.getScroll() as number),
+            left: 8,
+            width: 66,
+            height: 1,
+            style: {
+              fg: 'white',
+              bg: 'black',
+              focus: { fg: 'white', bg: 'black' },
+            },
+            value: criteriaDraft[index].text,
+          }, screen);
+
+          editInput.focus();
+          screen.render();
+
+          // Handle edit completion
+          editInput.key(['enter', 'escape'], () => {
+            if (editInput) {
+              criteriaDraft[editingIndex!].text = editInput.getValue().trim();
+              editInput.box.destroy();
+              editInput = null;
+              editingIndex = null;
+              listBox.focus();
+              renderList();
+            }
+          });
+
+          editInput.key(['tab'], () => {
+            if (editInput) {
+              criteriaDraft[editingIndex!].text = editInput.getValue().trim();
+              editInput.box.destroy();
+              editInput = null;
+              editingIndex = null;
+              // Move to next and start editing
+              selectedIndex = (selectedIndex + 1) % criteriaDraft.length;
+              listBox.select(selectedIndex);
+              renderList();
+              setTimeout(() => startEditing(selectedIndex), 10);
+            }
+          });
+        };
+
+        const stopEditing = (): void => {
+          if (editInput) {
+            criteriaDraft[editingIndex!].text = editInput.getValue().trim();
+            editInput.box.destroy();
+            editInput = null;
+            editingIndex = null;
+            listBox.focus();
+            renderList();
+          }
+        };
+
+        renderList();
+
+        // List navigation
+        listBox.on('select', (_item: any, index: number) => {
+          selectedIndex = index;
+        });
+
+        // Tab to edit selected item
+        listBox.key(['tab', 'e'], () => {
+          startEditing(selectedIndex);
+        });
+
+        // Add new criterion
+        listBox.key(['+', 'a'], () => {
+          stopEditing();
+          criteriaDraft.push({ text: '', completed: false });
+          selectedIndex = criteriaDraft.length - 1;
+          renderList();
+          setTimeout(() => startEditing(selectedIndex), 10);
+        });
+
+        // Remove selected criterion
+        listBox.key(['-', 'x', 'delete'], () => {
+          stopEditing();
+          if (criteriaDraft.length > 1) {
+            criteriaDraft.splice(selectedIndex, 1);
+            selectedIndex = Math.min(selectedIndex, criteriaDraft.length - 1);
+          } else {
+            criteriaDraft[0].text = '';
+          }
+          renderList();
+        });
+
+        const closeCriteriaModal = (): void => {
+          stopEditing();
+          modal.destroy();
+          loopListWindow.focus();
+          screen.render();
+        };
+
+        const finalizeCriteria = (): void => {
+          stopEditing();
+
+          const nextCriteria = criteriaDraft
+            .filter(criterion => criterion.text.trim().length > 0)
+            .map(criterion => ({ ...criterion, text: criterion.text.trim() }));
+
+          const updatedBody = applyAcceptanceCriteriaToIssueBody(issue.body || '', nextCriteria);
+          const updatedIssue: Issue = {
+            ...issue,
+            acceptanceCriteria: nextCriteria,
+            originalAcceptanceCriteria: originalCriteria,
+            body: updatedBody,
+          };
+
+          try {
+            updateIssueBody(updatedIssue.url, updatedBody);
+          } catch (err: any) {
+            logWithGlow(`{#ff006e-fg}[error]{/} ${err.message}`, 'error');
+          }
+
+          const loop = createLoop(updatedIssue, selectedAgent, skipPermissions, repoRoot);
+
+          state = loadState();
+          updateLoopList();
+          updateHeader();
+          updateTabBar();
+          syncSelectionAfterFilter();
+
+          const filteredIndex = loopListData.findIndex(l => l.id === loop.id);
+          if (filteredIndex >= 0) {
+            loopListWindow.select(filteredIndex);
+            loopListWindow.emit('select', null, filteredIndex);
+          }
+
+          logWithGlow(`{#00f5d4-fg}[system]{/} Loop created: ${updatedIssue.title}`, 'system');
+          logWithGlow(`{#666-fg}[system]{/} Press Enter to start the loop`, 'system');
+          closeCriteriaModal();
+        };
+
+        // Bottom bar with hints
+        blessed.text({
+          parent: modal,
+          top: 16,
+          left: 2,
+          tags: true,
+          content: '{#2de2e6-fg}Enter{/} Accept  {#ff4fd8-fg}Esc{/} Cancel  {#ffbe0b-fg}+{/} Add  {#ffbe0b-fg}-{/} Remove  {#9b5de5-fg}Tab{/} Edit',
+        });
+
+        listBox.key(['enter'], () => {
+          if (editingIndex === null) {
+            finalizeCriteria();
+          }
+        });
+
+        modal.key(['escape'], () => {
+          if (editingIndex !== null) {
+            stopEditing();
+          } else {
+            closeCriteriaModal();
+          }
+        });
+
+        listBox.focus();
+      };
+
       try {
         const issue = await fetchIssue(url);
-        const loop = createLoop(issue, selectedAgent, skipPermissions, repoRoot);
-
-        state = loadState();
-        updateLoopList();
-        updateHeader();
-        updateTabBar();
-        syncSelectionAfterFilter();
-
-        // Select the new loop
-        const filteredIndex = loopListData.findIndex(l => l.id === loop.id);
-        if (filteredIndex >= 0) {
-          loopListWindow.select(filteredIndex);
-          loopListWindow.emit('select', null, filteredIndex);
-        }
-
-        logWithGlow(`{#00f5d4-fg}[system]{/} Loop created: ${issue.title}`, 'system');
-        logWithGlow(`{#666-fg}[system]{/} Press Enter to start the loop`, 'system');
+        openCriteriaModal(issue);
       } catch (err: any) {
         logWithGlow(`{#ff006e-fg}[error]{/} ${err.message}`, 'error');
+        screen.render();
       }
-      screen.render();
     };
 
     createBtn.on('press', handleCreate);
@@ -976,6 +1303,8 @@ function main(): void {
         updateDetailPane(updatedLoop);
         updateStatusBar(updatedLoop);
       }
+      // Start tailing logs for the running loop
+      loadLogsForLoop(loop.id);
       screen.render();
     }
   });
@@ -990,20 +1319,43 @@ function main(): void {
     try {
       if (loop.status === 'running') {
         pauseLoop(loop.id);
+        state = loadState();
+        const updatedLoop = state.loops.find(l => l.id === selectedLoopId);
+        updateLoopList();
+        updateHeader();
+        updateTabBar();
+        const selectionChanged = syncSelectionAfterFilter();
+        if (!selectionChanged && updatedLoop) {
+          updateDetailPane(updatedLoop);
+          updateStatusBar(updatedLoop);
+        }
+        screen.render();
       } else if (loop.status === 'paused') {
-        resumeLoop(loop.id);
+        // Check if this is a cross-session resume (no active process)
+        if (canResumeInSession(loop.id)) {
+          // Same-session resume with SIGCONT
+          resumeLoop(loop.id);
+          state = loadState();
+          const updatedLoop = state.loops.find(l => l.id === selectedLoopId);
+          updateLoopList();
+          updateHeader();
+          updateTabBar();
+          const selectionChanged = syncSelectionAfterFilter();
+          if (!selectionChanged && updatedLoop) {
+            updateDetailPane(updatedLoop);
+            updateStatusBar(updatedLoop);
+          }
+          screen.render();
+        } else {
+          // Cross-session resume - spawn new process with context
+          logWithGlow('{#ffbe0b-fg}[system]{/} Resuming loop from previous session...', 'system');
+          screen.render();
+          resumePausedLoop(loop.id).catch((err: Error) => {
+            logWithGlow(`{#ff006e-fg}[error]{/} ${err.message}`, 'error');
+            screen.render();
+          });
+        }
       }
-      state = loadState();
-      const updatedLoop = state.loops.find(l => l.id === selectedLoopId);
-      updateLoopList();
-      updateHeader();
-      updateTabBar();
-      const selectionChanged = syncSelectionAfterFilter();
-      if (!selectionChanged && updatedLoop) {
-        updateDetailPane(updatedLoop);
-        updateStatusBar(updatedLoop);
-      }
-      screen.render();
     } catch (err: any) {
       logWithGlow(`{#ff006e-fg}[error]{/} ${err.message}`, 'error');
       screen.render();
@@ -1038,6 +1390,47 @@ function main(): void {
     }
   });
 
+  // D - Discard paused loop from previous session
+  screen.key(['d', 'D'], () => {
+    if (isAnyInputActive()) return;
+    if (!selectedLoopId) return;
+    const loop = state.loops.find(l => l.id === selectedLoopId);
+    if (!loop) return;
+
+    if (loop.status === 'paused' && loop.pausedFromPreviousSession) {
+      try {
+        discardPausedLoop(loop.id);
+        state = loadState();
+        // Select next loop or clear selection
+        const remainingLoops = state.loops;
+        if (remainingLoops.length > 0) {
+          selectedLoopId = remainingLoops[0].id;
+        } else {
+          selectedLoopId = null;
+        }
+        updateLoopList();
+        updateHeader();
+        updateTabBar();
+        syncSelectionAfterFilter();
+        if (selectedLoopId) {
+          const newLoop = state.loops.find(l => l.id === selectedLoopId);
+          if (newLoop) {
+            updateDetailPane(newLoop);
+            updateStatusBar(newLoop);
+          }
+        } else {
+          detailWindow.setContent('{#666-fg}No loops.{/}');
+          updateStatusBar();
+        }
+        logWithGlow('{#ffbe0b-fg}[system]{/} Paused loop discarded', 'system');
+        screen.render();
+      } catch (err: any) {
+        logWithGlow(`{#ff006e-fg}[error]{/} ${err.message}`, 'error');
+        screen.render();
+      }
+    }
+  });
+
   // R - Retry errored/stopped loop
   screen.key(['r', 'R'], () => {
     if (isAnyInputActive()) return;
@@ -1061,6 +1454,8 @@ function main(): void {
         updateDetailPane(updatedLoop);
         updateStatusBar(updatedLoop);
       }
+      // Refresh log view to show new retry logs
+      loadLogsForLoop(loop.id);
       screen.render();
     }
   });
@@ -1222,6 +1617,7 @@ function main(): void {
         closeModal();
       });
 
+      confirm.focus();
       screen.render();
     };
 
@@ -1249,12 +1645,15 @@ function main(): void {
       mouse: true,
     } as any);
 
-    closeBtn.on('press', () => {
+    const proceedToConfirm = (): void => {
       const comment = commentInput.getValue().trim();
       showConfirm(comment || undefined);
-    });
+    };
+
+    closeBtn.on('press', proceedToConfirm);
     cancelBtn.on('press', closeModal);
     modal.key(['escape'], closeModal);
+    modal.key(['y', 'Y', 'enter'], proceedToConfirm);
 
     screen.render();
   });
@@ -1324,6 +1723,19 @@ function main(): void {
     input.key(['escape'], closeModal);
     input.focus();
     screen.render();
+  });
+
+  // L - View full log
+  screen.key(['l', 'L'], () => {
+    if (isAnyInputActive()) return;
+    if (logViewer) {
+      closeLogViewer();
+      return;
+    }
+    if (!selectedLoopId) return;
+    const loop = state.loops.find(l => l.id === selectedLoopId);
+    if (!loop) return;
+    openLogViewer(loop);
   });
 
   // T - Refresh issue data

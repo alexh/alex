@@ -19,6 +19,12 @@ export interface AgentAdapter {
   // Extract session ID from agent output (returns null if not found)
   extractSessionId(output: string): string | null;
 
+  // Build follow-up prompt for session continuity (optional)
+  buildFollowUpPrompt?(context: string): string;
+
+  // Build prompt for resuming from a paused state (cross-session resume)
+  buildResumePrompt?(workSummary: string, remainingCriteria: string[]): string;
+
   // Check if agent CLI is available
   isAvailable(): boolean;
 }

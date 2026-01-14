@@ -20,6 +20,7 @@ export interface Issue {
   body: string;
   repo: string;           // owner/repo
   acceptanceCriteria: AcceptanceCriterion[];
+  originalAcceptanceCriteria?: AcceptanceCriterion[];
 }
 
 // A single loop instance
@@ -37,6 +38,10 @@ export interface Loop {
   workingDir: string;     // cwd for the agent
   iteration?: number;     // current iteration count
   exitReason?: string;    // why the loop exited
+  // Cross-session pause/resume fields
+  pausedSessionId?: string;   // Claude session ID at time of pause
+  pausedAt?: string;          // ISO timestamp when paused
+  pausedFromPreviousSession?: boolean; // True if paused in a previous TUI session
 }
 
 // Log entry for JSONL
